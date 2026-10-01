@@ -969,6 +969,14 @@ history_file = Path("data/betting_history.csv")
 if history_file.exists():
     history = pd.read_csv(history_file)
 
+    st.download_button(
+        "⬇️ Télécharger l'historique",
+        data=history.to_csv(index=False).encode("utf-8"),
+        file_name="betting_history_cloud.csv",
+        mime="text/csv",
+        key="download_history"
+    )
+
     if history.empty:
         st.info("Aucune analyse enregistrée.")
     else:
