@@ -1,4 +1,5 @@
 from pathlib import Path
+from supabase_db import load_history, upsert_rows
 import streamlit as st
 import pandas as pd
 import requests
@@ -378,7 +379,6 @@ if "daily_df" in st.session_state:
     )
 
     Path("data").mkdir(parents=True, exist_ok=True)
-    history_file_daily = Path("data/betting_history.csv")
 
     # Récupération automatique des cotes buteur Winamax
     try:
@@ -498,10 +498,11 @@ if "daily_df" in st.session_state:
         # Statut du pari : non joué par défaut
         daily_value["🎯 Joué"] = False
 
-        # Recharge le statut déjà enregistré si disponible
-        if history_file_daily.exists():
-            try:
-                history_selected = pd.read_csv(history_file_daily)
+        # Recharge le statut déjà enregistré depuis Supabase
+        try:
+            history_selected = pd.DataFrame(load_history())
+
+            if not history_selected.empty:
 
                 for idx, row in daily_value.iterrows():
 
@@ -526,15 +527,14 @@ if "daily_df" in st.session_state:
 
                     if (
                         not existing.empty
-                        and "selected" in existing.columns
                         and pd.notna(existing.iloc[-1]["selected"])
                     ):
                         daily_value.at[idx, "🎯 Joué"] = bool(
                             existing.iloc[-1]["selected"]
                         )
 
-            except Exception as e:
-                print("Erreur lecture statut pari :", e)
+        except Exception as e:
+            print("Erreur lecture statut pari Supabase :", e)
 
         daily_value = st.data_editor(
             daily_value[[
@@ -596,7 +596,6 @@ if "daily_df" in st.session_state:
             "💾 Enregistrer les cotes du jour",
             type="primary"
         ):
-            history_file = Path("data/betting_history.csv")
             rows = []
 
             # Retrouve les identifiants cachés depuis daily_df
@@ -649,15 +648,12 @@ if "daily_df" in st.session_state:
 
             if not new_history.empty:
 
-                if history_file.exists():
-                    old_history = pd.read_csv(history_file)
+                # Récupérer l'état existant depuis Supabase
+                old_history = pd.DataFrame(load_history())
 
-                    # Conserver le résultat et la cote réellement jouée
-                    if "bet_odds" not in old_history.columns:
-                        old_history["bet_odds"] = None
-
+                if not old_history.empty:
                     old_state = old_history[
-                        ["game_id", "player_id", "result", "bet_odds"]
+                        ["game_id", "player_id", "result", "selected", "bet_odds"]
                     ].drop_duplicates(
                         ["game_id", "player_id"],
                         keep="last"
@@ -670,27 +666,33 @@ if "daily_df" in st.session_state:
                         suffixes=("", "_old")
                     )
 
+                    # Ne jamais écraser un résultat déjà enregistré
                     new_history["result"] = new_history[
                         "result_old"
-                    ].combine_first(
-                        new_history["result"]
-                    )
+                    ].combine_first(new_history["result"])
 
+                    # Une sélection déjà jouée reste jouée
+                    new_history["selected"] = new_history[
+                        "selected_old"
+                    ].combine_first(new_history["selected"])
+
+                    # Une cote jouée déjà figée ne change jamais
                     new_history["bet_odds"] = new_history[
                         "bet_odds_old"
-                    ].combine_first(
-                        new_history["bet_odds"]
-                    )
+                    ].combine_first(new_history["bet_odds"])
 
                     new_history = new_history.drop(
-                        columns=["result_old", "bet_odds_old"]
+                        columns=[
+                            "result_old",
+                            "selected_old",
+                            "bet_odds_old"
+                        ]
                     )
 
                     history = pd.concat(
                         [old_history, new_history],
                         ignore_index=True
                     )
-
                 else:
                     history = new_history
 
@@ -699,11 +701,14 @@ if "daily_df" in st.session_state:
                     keep="last"
                 )
 
-                history_file.parent.mkdir(parents=True, exist_ok=True)
+                # Sauvegarde persistante dans Supabase
+                history_for_db = history.where(
+                    pd.notnull(history),
+                    None
+                )
 
-                history.to_csv(
-                    history_file,
-                    index=False
+                upsert_rows(
+                    history_for_db.to_dict(orient="records")
                 )
 
                 st.success(
@@ -786,12 +791,10 @@ if games:
 
     saved_odds = {}
 
-    history_file = Path("data/betting_history.csv")
+    try:
+        history = pd.DataFrame(load_history())
 
-    if history_file.exists():
-        try:
-            history = pd.read_csv(history_file)
-
+        if not history.empty:
             current_history = history[
                 history["game_id"].astype(str)
                 == str(selected_game["Game ID"])
@@ -803,8 +806,8 @@ if games:
                         saved["winamax_odds"]
                     )
 
-        except Exception as e:
-            print("Erreur lecture historique :", e)
+    except Exception as e:
+        print("Erreur lecture historique Supabase :", e)
 
     for df in [away_df, home_df]:
         if not df.empty:
@@ -964,10 +967,10 @@ if st.button("🔄 Mettre à jour les résultats", key="settle_history"):
     st.rerun()
 
 
-history_file = Path("data/betting_history.csv")
+history_data = load_history()
+history = pd.DataFrame(history_data)
 
-if history_file.exists():
-    history = pd.read_csv(history_file)
+if not history.empty:
 
     st.download_button(
         "⬇️ Télécharger l'historique",
@@ -991,14 +994,15 @@ if history_file.exists():
         ]:
             history_display[col] = history_display[col] * 100
 
-        # Profit théorique pour une mise de 1 unité
+        # Profit réel simulé pour une mise fixe de 1 unité
+        # calculé avec la cote figée au moment de la sélection
         history_display["Profit (u)"] = history_display.apply(
             lambda row:
-                row["winamax_odds"] - 1
-                if row["result"] == 1
+                row["bet_odds"] - 1
+                if row["selected"] == 1 and row["result"] == 1
                 else (
                     -1.0
-                    if row["result"] == 0
+                    if row["selected"] == 1 and row["result"] == 0
                     else None
                 ),
             axis=1
@@ -1077,34 +1081,43 @@ if "history_edited" in locals():
 
     if st.button("💾 Enregistrer les paris joués"):
 
-        history_original = pd.read_csv(
-            "data/betting_history.csv"
-        )
+        # Toujours repartir de l'état actuel de Supabase
+        history_original = pd.DataFrame(load_history())
 
-        # On associe les lignes affichées aux lignes du CSV
         for _, edited_row in history_edited.iterrows():
 
-            mask = (
-                (history_original["game_id"].astype(str) ==
-                 str(
-                     history[
-                         (history["player"] == edited_row["Joueur"]) &
-                         (history["match"] == edited_row["Match"])
-                     ]["game_id"].iloc[0]
-                 ))
-                &
+            matching = history_original[
                 (history_original["player"] == edited_row["Joueur"])
+                & (history_original["match"] == edited_row["Match"])
+            ]
+
+            if matching.empty:
+                continue
+
+            game_id = matching.iloc[0]["game_id"]
+
+            mask = (
+                (history_original["game_id"].astype(str) == str(game_id))
+                & (history_original["player"] == edited_row["Joueur"])
             )
 
             played = int(edited_row["🎯 Joué"])
 
-            history_original.loc[
-                mask,
-                "selected"
-            ] = played
+            # Un pari déjà enregistré comme joué reste joué.
+            already_played = (
+                history_original.loc[mask, "selected"]
+                .fillna(0)
+                .astype(int)
+                .eq(1)
+                .any()
+            )
 
-            # Figer la cote au moment où le pari est joué.
-            # Une cote déjà figée ne sera jamais remplacée.
+            if already_played:
+                played = 1
+
+            history_original.loc[mask, "selected"] = played
+
+            # Figer définitivement la cote au premier passage à "joué".
             if played == 1:
                 needs_bet_odds = (
                     mask
@@ -1119,9 +1132,13 @@ if "history_edited" in locals():
                     "winamax_odds"
                 ]
 
-        history_original.to_csv(
-            "data/betting_history.csv",
-            index=False
+        history_for_db = history_original.where(
+            pd.notnull(history_original),
+            None
+        )
+
+        upsert_rows(
+            history_for_db.to_dict(orient="records")
         )
 
         st.success("Paris joués enregistrés.")
@@ -1135,10 +1152,9 @@ if "history_edited" in locals():
 st.divider()
 st.subheader("💰 Performance des paris joués")
 
-history_file = Path("data/betting_history.csv")
+performance = pd.DataFrame(load_history())
 
-if history_file.exists():
-    performance = pd.read_csv(history_file)
+if not performance.empty:
 
     settled_bets = performance[
         (performance["selected"] == 1)

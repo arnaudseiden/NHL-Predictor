@@ -1,8 +1,6 @@
 import pandas as pd
 import requests
-from pathlib import Path
-
-HISTORY_FILE = Path("data/betting_history.csv")
+from supabase_db import load_history, upsert_rows
 
 
 def get_game_result(game_id):
@@ -64,11 +62,12 @@ def get_game_result(game_id):
 
 
 def settle_history():
-    if not HISTORY_FILE.exists():
+    history_data = load_history()
+    df = pd.DataFrame(history_data)
+
+    if df.empty:
         print("Aucun historique trouvé.")
         return
-
-    df = pd.read_csv(HISTORY_FILE)
 
     pending = df[df["result"].isna()].copy()
 
@@ -122,9 +121,16 @@ def settle_history():
                 f"Match {game_id} non réglé : {e}"
             )
 
-    df.to_csv(HISTORY_FILE, index=False)
+    df_for_db = df.where(
+        pd.notnull(df),
+        None
+    )
 
-    print("Historique mis à jour.")
+    upsert_rows(
+        df_for_db.to_dict(orient="records")
+    )
+
+    print("Historique Supabase mis à jour.")
 
 
 if __name__ == "__main__":
